@@ -79,30 +79,49 @@ async function callDoubaoChat(prompt, model, ratio) {
   return parseSSEResponse(await response.text());
 }
 
-async function callViaFreeApi(url, token, prompt, model, ratio) {
+async function callViaFreeApi(url, token, prompt, model, ratio, style) {
   console.log('[proxy] Calling free-api:', url);
+  console.log('[proxy] Request body:', JSON.stringify({ model, prompt, ratio, style, stream: false }));
+  
+  const body = { model: model || 'Seedream 5.0', prompt, ratio: ratio || '1:1', stream: false };
+  if (style !== undefined) body.style = style;
+  
   const response = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
-    body: JSON.stringify({ model: model || 'Seedream 5.0', prompt, ratio: ratio || '1:1', stream: false }),
+    body: JSON.stringify(body),
   });
+  
+  console.log('[proxy] Response status:', response.status);
   if (!response.ok) throw new Error('Free-API returned ' + response.status);
+  
   const raw = await response.json();
-
-  // free-api can return an array [{choices:[{message:{images:[...]}}]}] or a plain object
+  
+  // DEBUG: Log raw response
+  console.log('[proxy] Raw response type:', Array.isArray(raw) ? 'array' : typeof raw);
+  console.log('[proxy] Raw response:', JSON.stringify(raw).slice(0, 500));
+  
+  // Handle both array and object responses
   const data = Array.isArray(raw) ? raw[0] : raw;
-
-  // Try multiple response shapes
+  
+  // Try to extract images from choices[0].message.images
   let imageUrls = [];
   if (data?.choices?.[0]?.message?.images) {
     imageUrls = data.choices[0].message.images;
+    console.log('[proxy] Found images in choices[0].message.images:', imageUrls.length);
   } else if (data?.data?.[0]?.url) {
     imageUrls = data.data.map(d => d.url);
+    console.log('[proxy] Found images in data[0].url');
   } else if (data?.images) {
     imageUrls = data.images;
+    console.log('[proxy] Found images in images');
+  } else {
+    console.log('[proxy] Could not find images in response');
+    console.log('[proxy] data.choices:', data?.choices ? 'exists' : 'missing');
+    console.log('[proxy] data.choices[0]:', data?.choices?.[0] ? 'exists' : 'missing');
+    console.log('[proxy] data.choices[0].message:', data?.choices?.[0]?.message ? 'exists' : 'missing');
+    console.log('[proxy] data.choices[0].message.images:', data?.choices?.[0]?.message?.images);
   }
-
-  console.log('[proxy] Found', imageUrls.length, 'image URLs');
 
   return imageUrls.map(u => {
     const match = typeof u === 'string' ? u.match(/rc_gen_image\/([^?~]+)/) : null;
@@ -111,7 +130,7 @@ async function callViaFreeApi(url, token, prompt, model, ratio) {
 }
 
 async function handleGenerate(req, res) {
-  const { prompt, model, ratio, mode, free_api_url, free_api_token } = req.body;
+  const { prompt, model, ratio, style, mode, free_api_url, free_api_token } = req.body;
   if (!prompt) return res.status(400).json({ error: 'prompt is required' });
 
   console.log(`\n[api] /api/generate — mode=${mode || 'auto'} prompt="${prompt.slice(0, 60)}"`);
@@ -137,7 +156,7 @@ async function handleGenerate(req, res) {
   const proxyToken = free_api_token || process.env.FREE_API_TOKEN;
   if (proxyUrl) {
     try {
-      images = await callViaFreeApi(proxyUrl, proxyToken || '', prompt, model, ratio);
+      images = await callViaFreeApi(proxyUrl, proxyToken || '', prompt, model, ratio, style);
       return res.json({ success: true, source: 'proxy', prompt, count: images.length, images, created: Math.floor(Date.now()/1000), data: images.map(i => ({ url: i.no_watermark_url, width: i.width, height: i.height })) });
     } catch (e) {
       console.error('[api] Free-API failed:', e.message);
