@@ -38,20 +38,31 @@ function authMiddleware(req, res, next) {
 function parseSSEResponse(text) {
   const images = [];
   const seen = new Set();
-  for (const line of text.split('\n')) {
+  const lines = text.split('\n');
+  console.log('[direct] SSE response has', lines.length, 'lines');
+  
+  for (const line of lines) {
     let d = line.trim();
     if (d.startsWith('data: ')) d = d.slice(6);
     else if (d.startsWith('data:')) d = d.slice(5);
     if (!d.startsWith('{')) continue;
     try {
       const data = JSON.parse(d);
+      // Log first few data events for debugging
+      if (images.length === 0 && lines.indexOf(line) < 10) {
+        console.log('[direct] SSE event keys:', Object.keys(data).join(', '));
+      }
       extractImages(data, images, seen);
       for (const op of (data?.patch_op || [])) {
         for (const block of (op?.patch_value?.content_block || [])) {
           extractImages(block, images, seen);
         }
       }
-    } catch (_) {}
+    } catch (err) {
+      if (lines.indexOf(line) < 10) {
+        console.log('[direct] Failed to parse SSE line:', d.slice(0, 100));
+      }
+    }
   }
   return images;
 }
@@ -59,8 +70,13 @@ function parseSSEResponse(text) {
 function extractImages(data, images, seen) {
   const blockArr = Array.isArray(data?.content_block) ? data.content_block : [data];
   for (const block of blockArr) {
-    for (const c of (block?.content?.creation_block?.creations || [])) {
+    const creations = block?.content?.creation_block?.creations;
+    if (creations) {
+      console.log('[direct] Found creation_block with', creations.length, 'creations');
+    }
+    for (const c of (creations || [])) {
       const raw = c?.image?.image_ori_raw;
+      console.log('[direct] creation has image_ori_raw:', !!raw?.url, 'image_thumb:', !!c?.image?.image_thumb?.url);
       if (!raw?.url || seen.has(raw.url)) continue;
       seen.add(raw.url);
       images.push({ no_watermark_url: raw.url, watermark_url: c?.image?.image_thumb?.url || null, width: raw.width || null, height: raw.height || null });
@@ -70,14 +86,29 @@ function extractImages(data, images, seen) {
 
 async function callDoubaoChat(prompt, model, ratio, cookies) {
   const cookiesToUse = cookies || storedCookies;
-  if (!cookiesToUse) throw new Error('No cookies set. Call POST /api/auth/cookies first or pass cookies in request.');
+  if (!cookiesToUse) throw new Error('No cookies set. Pass cookies in request.');
+  
+  console.log('[direct] Calling', DOUBAO_CHAT_API);
+  console.log('[direct] Cookie length:', cookiesToUse.length);
+  console.log('[direct] Request:', JSON.stringify({ model, prompt, ratio, stream: true }));
+  
   const response = await fetch(DOUBAO_CHAT_API, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream', 'Origin': DOUBAO_ORIGIN, 'Referer': DOUBAO_ORIGIN + '/chat/', 'Cookie': cookiesToUse, 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
     body: JSON.stringify({ model: model || 'Seedream 5.0', prompt, ratio: ratio || '1:1', stream: true }),
   });
-  if (!response.ok) throw new Error('Doubao API returned ' + response.status);
-  return parseSSEResponse(await response.text());
+  
+  console.log('[direct] Response status:', response.status);
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.log('[direct] Response error:', errorText.slice(0, 200));
+    throw new Error('Doubao API returned ' + response.status);
+  }
+  
+  const text = await response.text();
+  console.log('[direct] Response length:', text.length);
+  
+  return parseSSEResponse(text);
 }
 
 async function callViaFreeApi(url, token, prompt, model, ratio, style) {
@@ -135,9 +166,15 @@ async function handleGenerate(req, res) {
   if ((mode === 'direct' || (mode !== 'proxy' && storedCookies))) {
     try {
       images = await callDoubaoChat(prompt, model, ratio, cookies || storedCookies);
+      console.log('[api] Direct API returned', images.length, 'image(s)');
+      
       if (images.length > 0) {
-        console.log('[api] Direct API returned', images.length, 'image(s)');
         return res.json({ success: true, source: 'direct', prompt, count: images.length, images, created: Math.floor(Date.now()/1000), data: images.map(i => ({ url: i.no_watermark_url, width: i.width, height: i.height })) });
+      }
+      
+      // Direct mode with 0 images - return error instead of falling through
+      if (mode === 'direct') {
+        return res.status(500).json({ error: 'Direct API returned 0 images. Check cookies or try proxy mode.' });
       }
     } catch (e) {
       console.warn('[api] Direct API failed:', e.message);
