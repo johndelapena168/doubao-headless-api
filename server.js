@@ -68,11 +68,12 @@ function extractImages(data, images, seen) {
   }
 }
 
-async function callDoubaoChat(prompt, model, ratio) {
-  if (!storedCookies) throw new Error('No cookies set. Call POST /api/auth/cookies first.');
+async function callDoubaoChat(prompt, model, ratio, cookies) {
+  const cookiesToUse = cookies || storedCookies;
+  if (!cookiesToUse) throw new Error('No cookies set. Call POST /api/auth/cookies first or pass cookies in request.');
   const response = await fetch(DOUBAO_CHAT_API, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream', 'Origin': DOUBAO_ORIGIN, 'Referer': DOUBAO_ORIGIN + '/chat/', 'Cookie': storedCookies, 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+    headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream', 'Origin': DOUBAO_ORIGIN, 'Referer': DOUBAO_ORIGIN + '/chat/', 'Cookie': cookiesToUse, 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
     body: JSON.stringify({ model: model || 'Seedream 5.0', prompt, ratio: ratio || '1:1', stream: true }),
   });
   if (!response.ok) throw new Error('Doubao API returned ' + response.status);
@@ -81,7 +82,6 @@ async function callDoubaoChat(prompt, model, ratio) {
 
 async function callViaFreeApi(url, token, prompt, model, ratio, style) {
   console.log('[proxy] Calling free-api:', url);
-  console.log('[proxy] Request body:', JSON.stringify({ model, prompt, ratio, style, stream: false }));
   
   const body = { model: model || 'Seedream 5.0', prompt, ratio: ratio || '1:1', stream: false };
   if (style !== undefined) body.style = style;
@@ -92,36 +92,21 @@ async function callViaFreeApi(url, token, prompt, model, ratio, style) {
     body: JSON.stringify(body),
   });
   
-  console.log('[proxy] Response status:', response.status);
   if (!response.ok) throw new Error('Free-API returned ' + response.status);
   
   const raw = await response.json();
-  
-  // DEBUG: Log raw response
-  console.log('[proxy] Raw response type:', Array.isArray(raw) ? 'array' : typeof raw);
-  console.log('[proxy] Raw response:', JSON.stringify(raw).slice(0, 500));
-  
-  // Handle both array and object responses
   const data = Array.isArray(raw) ? raw[0] : raw;
   
-  // Try to extract images from choices[0].message.images
   let imageUrls = [];
   if (data?.choices?.[0]?.message?.images) {
     imageUrls = data.choices[0].message.images;
-    console.log('[proxy] Found images in choices[0].message.images:', imageUrls.length);
   } else if (data?.data?.[0]?.url) {
     imageUrls = data.data.map(d => d.url);
-    console.log('[proxy] Found images in data[0].url');
   } else if (data?.images) {
     imageUrls = data.images;
-    console.log('[proxy] Found images in images');
-  } else {
-    console.log('[proxy] Could not find images in response');
-    console.log('[proxy] data.choices:', data?.choices ? 'exists' : 'missing');
-    console.log('[proxy] data.choices[0]:', data?.choices?.[0] ? 'exists' : 'missing');
-    console.log('[proxy] data.choices[0].message:', data?.choices?.[0]?.message ? 'exists' : 'missing');
-    console.log('[proxy] data.choices[0].message.images:', data?.choices?.[0]?.message?.images);
   }
+
+  console.log('[proxy] Found', imageUrls.length, 'image URLs');
 
   return imageUrls.map(u => {
     const match = typeof u === 'string' ? u.match(/rc_gen_image\/([^?~]+)/) : null;
@@ -130,17 +115,26 @@ async function callViaFreeApi(url, token, prompt, model, ratio, style) {
 }
 
 async function handleGenerate(req, res) {
-  const { prompt, model, ratio, style, mode, free_api_url, free_api_token } = req.body;
+  const { prompt, model, ratio, style, mode, cookies, free_api_url, free_api_token } = req.body;
   if (!prompt) return res.status(400).json({ error: 'prompt is required' });
 
   console.log(`\n[api] /api/generate — mode=${mode || 'auto'} prompt="${prompt.slice(0, 60)}"`);
+  
+  // If cookies are passed in request, update stored cookies
+  if (cookies) {
+    storedCookies = cookies;
+    try {
+      fs.writeFileSync(COOKIES_FILE, JSON.stringify({ cookies: storedCookies, savedAt: new Date().toISOString() }));
+      console.log('[api] Cookies updated from request, length:', cookies.length);
+    } catch (e) {}
+  }
 
   let images = [];
 
   // Mode 1: Direct Doubao API (needs cookies)
   if ((mode === 'direct' || (mode !== 'proxy' && storedCookies))) {
     try {
-      images = await callDoubaoChat(prompt, model, ratio);
+      images = await callDoubaoChat(prompt, model, ratio, cookies || storedCookies);
       if (images.length > 0) {
         console.log('[api] Direct API returned', images.length, 'image(s)');
         return res.json({ success: true, source: 'direct', prompt, count: images.length, images, created: Math.floor(Date.now()/1000), data: images.map(i => ({ url: i.no_watermark_url, width: i.width, height: i.height })) });
@@ -164,7 +158,7 @@ async function handleGenerate(req, res) {
     }
   }
 
-  res.status(400).json({ error: 'No cookies set and no free-api URL. Call POST /api/auth/cookies or set FREE_API_URL.' });
+  res.status(400).json({ error: 'No cookies set and no free-api URL. Pass cookies in request or set FREE_API_URL.' });
 }
 
 app.get('/health', (req, res) => res.json({ status: 'ok', hasCookies: !!storedCookies, mode: storedCookies ? 'direct+proxy' : 'proxy-only' }));
@@ -174,6 +168,7 @@ app.post('/api/auth/cookies', (req, res) => {
   if (!cookies) return res.status(400).json({ error: 'cookies required' });
   storedCookies = typeof cookies === 'string' ? cookies : Array.isArray(cookies) ? cookies.map(c => c.name + '=' + c.value).join('; ') : '';
   fs.writeFileSync(COOKIES_FILE, JSON.stringify({ cookies: storedCookies, savedAt: new Date().toISOString() }));
+  console.log('[api] Cookies set via /api/auth/cookies, length:', storedCookies.length);
   res.json({ success: true, length: storedCookies.length });
 });
 
@@ -184,5 +179,5 @@ app.post('/v1/images/generations', authMiddleware, handleGenerate);
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log('doubao-headless-api on port ' + PORT);
-  console.log('Cookies:', storedCookies ? 'loaded' : 'not set');
+  console.log('Cookies:', storedCookies ? 'loaded (length:' + storedCookies.length + ')' : 'not set');
 });
