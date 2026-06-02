@@ -80,33 +80,71 @@ async function callDoubaoChat(prompt, model, ratio) {
 }
 
 async function callViaFreeApi(url, token, prompt, model, ratio) {
-  const resp = await fetch(url, {
+  console.log('[proxy] Calling free-api:', url);
+  const response = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
     body: JSON.stringify({ model: model || 'Seedream 5.0', prompt, ratio: ratio || '1:1', stream: false }),
   });
-  if (!resp.ok) throw new Error('Free-API returned ' + resp.status);
-  const data = await resp.json();
-  const imgs = data?.choices?.[0]?.message?.images || [];
-  return imgs.map(u => ({ no_watermark_url: u, watermark_url: u, source: 'free-api' }));
+  if (!response.ok) throw new Error('Free-API returned ' + response.status);
+  const raw = await response.json();
+
+  // free-api can return an array [{choices:[{message:{images:[...]}}]}] or a plain object
+  const data = Array.isArray(raw) ? raw[0] : raw;
+
+  // Try multiple response shapes
+  let imageUrls = [];
+  if (data?.choices?.[0]?.message?.images) {
+    imageUrls = data.choices[0].message.images;
+  } else if (data?.data?.[0]?.url) {
+    imageUrls = data.data.map(d => d.url);
+  } else if (data?.images) {
+    imageUrls = data.images;
+  }
+
+  console.log('[proxy] Found', imageUrls.length, 'image URLs');
+
+  return imageUrls.map(u => {
+    const match = typeof u === 'string' ? u.match(/rc_gen_image\/([^?~]+)/) : null;
+    return { no_watermark_url: u, watermark_url: u, file_key: match ? match[1] : null, source: 'free-api' };
+  });
 }
 
 async function handleGenerate(req, res) {
   const { prompt, model, ratio, mode, free_api_url, free_api_token } = req.body;
   if (!prompt) return res.status(400).json({ error: 'prompt is required' });
+
+  console.log(`\n[api] /api/generate — mode=${mode || 'auto'} prompt="${prompt.slice(0, 60)}"`);
+
   let images = [];
+
+  // Mode 1: Direct Doubao API (needs cookies)
   if ((mode === 'direct' || (mode !== 'proxy' && storedCookies))) {
     try {
       images = await callDoubaoChat(prompt, model, ratio);
-      if (images.length > 0) return res.json({ success: true, source: 'direct', prompt, count: images.length, images, created: Math.floor(Date.now()/1000), data: images.map(i => ({ url: i.no_watermark_url, width: i.width, height: i.height })) });
-    } catch (e) { if (mode === 'direct') return res.status(500).json({ error: e.message }); }
+      if (images.length > 0) {
+        console.log('[api] Direct API returned', images.length, 'image(s)');
+        return res.json({ success: true, source: 'direct', prompt, count: images.length, images, created: Math.floor(Date.now()/1000), data: images.map(i => ({ url: i.no_watermark_url, width: i.width, height: i.height })) });
+      }
+    } catch (e) {
+      console.warn('[api] Direct API failed:', e.message);
+      if (mode === 'direct') return res.status(500).json({ error: e.message });
+    }
   }
+
+  // Mode 2: Proxy through free-api
   const proxyUrl = free_api_url || process.env.FREE_API_URL;
   const proxyToken = free_api_token || process.env.FREE_API_TOKEN;
   if (proxyUrl) {
-    images = await callViaFreeApi(proxyUrl, proxyToken || '', prompt, model, ratio);
-    return res.json({ success: true, source: 'proxy', prompt, count: images.length, images, created: Math.floor(Date.now()/1000), data: images.map(i => ({ url: i.no_watermark_url })) });
+    try {
+      images = await callViaFreeApi(proxyUrl, proxyToken || '', prompt, model, ratio);
+      return res.json({ success: true, source: 'proxy', prompt, count: images.length, images, created: Math.floor(Date.now()/1000), data: images.map(i => ({ url: i.no_watermark_url, width: i.width, height: i.height })) });
+    } catch (e) {
+      console.error('[api] Free-API failed:', e.message);
+      return res.status(500).json({ error: e.message });
+    }
   }
+
   res.status(400).json({ error: 'No cookies set and no free-api URL. Call POST /api/auth/cookies or set FREE_API_URL.' });
 }
 
@@ -115,7 +153,7 @@ app.get('/health', (req, res) => res.json({ status: 'ok', hasCookies: !!storedCo
 app.post('/api/auth/cookies', (req, res) => {
   const { cookies } = req.body;
   if (!cookies) return res.status(400).json({ error: 'cookies required' });
-  storedCookies = typeof cookies === 'string' ? cookies : cookies.map(c => c.name + '=' + c.value).join('; ');
+  storedCookies = typeof cookies === 'string' ? cookies : Array.isArray(cookies) ? cookies.map(c => c.name + '=' + c.value).join('; ') : '';
   fs.writeFileSync(COOKIES_FILE, JSON.stringify({ cookies: storedCookies, savedAt: new Date().toISOString() }));
   res.json({ success: true, length: storedCookies.length });
 });
